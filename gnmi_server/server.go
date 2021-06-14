@@ -1,6 +1,7 @@
 package gnmi
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
@@ -8,13 +9,16 @@ import (
 	"sync"
 
 	log "github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
+	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
+	gnmi_extpb "github.com/openconfig/gnmi/proto/gnmi_ext"
+	gnoi_system_pb "github.com/openconfig/gnoi/system"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
-
 	sdc "github.com/Azure/sonic-telemetry/sonic_data_client"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 )
@@ -160,12 +164,12 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 	var target string
 	prefix := req.GetPrefix()
 	if prefix == nil {
-	       return nil, status.Error(codes.Unimplemented, "No target specified in prefix")
+		return nil, status.Error(codes.Unimplemented, "No target specified in prefix")
 	} else {
-	       target = prefix.GetTarget()
-	       if target == "" {
-	               return nil, status.Error(codes.Unimplemented, "Empty target data not supported yet")
-	       }
+		target = prefix.GetTarget()
+		if target == "" {
+			return nil, status.Error(codes.Unimplemented, "Empty target data not supported yet")
+		}
 	}
 
 	paths := req.GetPath()
@@ -176,7 +180,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 
 	if target == "OTHERS" {
 		dc, err = sdc.NewNonDbClient(paths, prefix)
-	} else if isTargetDb(target) == true {
+	} else if _, ok, _, _ := sdc.IsTargetDb(target); ok {
 		dc, err = sdc.NewDbClient(paths, prefix)
 	} else {
 		/* If no prefix target is specified create new Transl Data Client . */
@@ -305,18 +309,3 @@ func (srv *Server) Capabilities(context.Context, *gnmipb.CapabilityRequest) (*gn
 				 	  SupportedEncodings: supportedEncodings,
 					  GNMIVersion: "0.7.0"}, nil
 }
-
-func  isTargetDb ( target string) (bool) {
-	isDbClient := false 
-	dbTargetSupported := []string { "APPL_DB", "ASIC_DB" , "COUNTERS_DB", "LOGLEVEL_DB", "CONFIG_DB", "PFC_WD_DB", "FLEX_COUNTER_DB", "STATE_DB"}
-
-	    for _, name := range  dbTargetSupported {
-		    if  target ==  name {
-			    isDbClient = true
-				    return isDbClient
-		    }
-	    }
-
-	    return isDbClient
-}
-

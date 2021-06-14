@@ -2,7 +2,6 @@ package gnmi
 
 // server_test covers gNMI get, subscribe (stream and poll) test
 // Prerequisite: redis-server should be running.
-
 import (
 	"crypto/tls"
 	"encoding/json"
@@ -28,6 +27,7 @@ import (
 	// Register supported client types.
 	sdc "github.com/Azure/sonic-telemetry/sonic_data_client"
 	sdcfg "github.com/Azure/sonic-telemetry/sonic_db_config"
+	"github.com/Azure/sonic-telemetry/test_utils"
 	gclient "github.com/jipanyang/gnmi/client/gnmi"
 
 )
@@ -218,10 +218,10 @@ func runServer(t *testing.T, s *Server) {
 	//t.Log("Exiting RPC server on address", s.Address())
 }
 
-func getRedisClientN(t *testing.T, n int) *redis.Client {
+func getRedisClientN(t *testing.T, n int, namespace string) *redis.Client {
 	rclient := redis.NewClient(&redis.Options{
 		Network:     "tcp",
-		Addr:        sdcfg.GetDbTcpAddr("COUNTERS_DB"),
+		Addr:        sdcfg.GetDbTcpAddr("COUNTERS_DB", namespace),
 		Password:    "", // no password set
 		DB:          n,
 		DialTimeout: 0,
@@ -233,12 +233,13 @@ func getRedisClientN(t *testing.T, n int) *redis.Client {
 	return rclient
 }
 
-func getRedisClient(t *testing.T) *redis.Client {
+func getRedisClient(t *testing.T, namespace string) *redis.Client {
+
 	rclient := redis.NewClient(&redis.Options{
 		Network:     "tcp",
-		Addr:        sdcfg.GetDbTcpAddr("COUNTERS_DB"),
+		Addr:        sdcfg.GetDbTcpAddr("COUNTERS_DB", namespace),
 		Password:    "", // no password set
-		DB:          sdcfg.GetDbId("COUNTERS_DB"),
+		DB:          sdcfg.GetDbId("COUNTERS_DB", namespace),
 		DialTimeout: 0,
 	})
 	_, err := rclient.Ping().Result()
@@ -248,12 +249,13 @@ func getRedisClient(t *testing.T) *redis.Client {
 	return rclient
 }
 
-func getConfigDbClient(t *testing.T) *redis.Client {
+func getConfigDbClient(t *testing.T, namespace string) *redis.Client {
+
 	rclient := redis.NewClient(&redis.Options{
 		Network:     "tcp",
-		Addr:        sdcfg.GetDbTcpAddr("CONFIG_DB"),
+		Addr:        sdcfg.GetDbTcpAddr("CONFIG_DB", namespace),
 		Password:    "", // no password set
-		DB:          sdcfg.GetDbId("CONFIG_DB"),
+		DB:          sdcfg.GetDbId("CONFIG_DB", namespace),
 		DialTimeout: 0,
 	})
 	_, err := rclient.Ping().Result()
@@ -277,8 +279,8 @@ func loadConfigDB(t *testing.T, rclient *redis.Client, mpi map[string]interface{
 	}
 }
 
-func prepareConfigDb(t *testing.T) {
-	rclient := getConfigDbClient(t)
+func prepareConfigDb(t *testing.T, namespace string) {
+	rclient := getConfigDbClient(t, namespace)
 	defer rclient.Close()
 	rclient.FlushDB()
 
@@ -298,9 +300,15 @@ func prepareConfigDb(t *testing.T) {
 	mpi_pfcwd_map := loadConfig(t, "", configPfcwdByte)
 	loadConfigDB(t, rclient, mpi_pfcwd_map)
 }
+func prepareStateDb(t *testing.T, namespace string) {
+	rclient := getRedisClientN(t, 6, namespace)
+	defer rclient.Close()
+	rclient.FlushDB()
+	rclient.HSet("SWITCH_CAPABILITY|switch", "test_field", "test_value")
+}
 
-func prepareDb(t *testing.T) {
-	rclient := getRedisClient(t)
+func prepareDb(t *testing.T, namespace string) {
+	rclient := getRedisClient(t, namespace)
 	defer rclient.Close()
 	rclient.FlushDB()
 	//Enable keysapce notification
@@ -382,11 +390,14 @@ func prepareDb(t *testing.T) {
 	loadDB(t, rclient, mpi_counter)
 
 	// Load CONFIG_DB for alias translation
-	prepareConfigDb(t)
+	prepareConfigDb(t, namespace)
+
+	//Load STATE_DB to test non V2R dataset
+	prepareStateDb(t, namespace)
 }
 
 func prepareDbTranslib(t *testing.T) {
-	rclient := getRedisClient(t)
+	rclient := getRedisClient(t, sdcfg.GetDbDefaultNamespace())
 	rclient.FlushDB()
 	rclient.Close()
 	
@@ -406,7 +417,7 @@ func prepareDbTranslib(t *testing.T) {
 		t.Fatalf("read file %v err: %v", fileName, err)
 	}
 	for n, v := range rj {
-		rclient := getRedisClientN(t, n)
+		rclient := getRedisClientN(t, n, sdcfg.GetDbDefaultNamespace())
 		loadDBNotStrict(t, rclient, v)
 		rclient.Close()
 	}
@@ -510,15 +521,7 @@ func TestGnmiSet(t *testing.T) {
 	s.s.Stop()
 }
 
-
-
-func TestGnmiGet(t *testing.T) {
-	//t.Log("Start server")
-	s := createServer(t)
-	go runServer(t, s)
-
-	prepareDb(t)
-
+func runGnmiTestGet(t *testing.T, namespace string) {
 	//t.Log("Start gNMI client")
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))}
@@ -598,101 +601,119 @@ func TestGnmiGet(t *testing.T) {
 		`,
 		wantRetCode: codes.Unimplemented,
 	}, {
-		desc:       "Get valid but non-existing node",
-		pathTarget: "COUNTERS_DB",
+		desc:       "Test passing asic in path for V2R Dataset Target",
+		pathTarget: "COUNTER_DB" + "/" + namespace,
 		textPbPath: `
+					elem: <name: "COUNTERS" >
+					elem: <name: "Ethernet68" >
+				`,
+		wantRetCode: codes.NotFound,
+	},
+		{
+			desc:       "Get valid but non-existing node",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 			elem: <name: "MyCounters" >
 		`,
-		wantRetCode: codes.NotFound,
-	}, {
-		desc:       "Get COUNTERS_PORT_NAME_MAP",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.NotFound,
+		}, {
+			desc:       "Get COUNTERS_PORT_NAME_MAP",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 			elem: <name: "COUNTERS_PORT_NAME_MAP" >
 		`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersPortNameMapByte,
-	}, {
-		desc:       "get COUNTERS:Ethernet68",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersPortNameMapByte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS:Ethernet68",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet68" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersEthernet68Byte,
-	}, {
-		desc:       "get COUNTERS:Ethernet68 SAI_PORT_STAT_PFC_7_RX_PKTS",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersEthernet68Byte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS:Ethernet68 SAI_PORT_STAT_PFC_7_RX_PKTS",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet68" >
 					elem: <name: "SAI_PORT_STAT_PFC_7_RX_PKTS" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: "2",
-	}, {
-		desc:       "get COUNTERS:Ethernet68 Pfcwd",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: "2",
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS:Ethernet68 Pfcwd",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet68" >
 					elem: <name: "Pfcwd" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersEthernet68PfcwdByte,
-	}, {
-		desc:       "get COUNTERS (use vendor alias):Ethernet68/1",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersEthernet68PfcwdByte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS (use vendor alias):Ethernet68/1",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet68/1" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersEthernet68Byte,
-	}, {
-		desc:       "get COUNTERS (use vendor alias):Ethernet68/1 SAI_PORT_STAT_PFC_7_RX_PKTS",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersEthernet68Byte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS (use vendor alias):Ethernet68/1 SAI_PORT_STAT_PFC_7_RX_PKTS",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet68/1" >
 					elem: <name: "SAI_PORT_STAT_PFC_7_RX_PKTS" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: "2",
-	}, {
-		desc:       "get COUNTERS (use vendor alias):Ethernet68/1 Pfcwd",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: "2",
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS (use vendor alias):Ethernet68/1 Pfcwd",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet68/1" >
 					elem: <name: "Pfcwd" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersEthernet68PfcwdAliasByte,
-	}, {
-		desc:       "get COUNTERS:Ethernet*",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersEthernet68PfcwdAliasByte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS:Ethernet*",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet*" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersEthernetWildcardByte,
-	}, {
-		desc:       "get COUNTERS:Ethernet* SAI_PORT_STAT_PFC_7_RX_PKTS",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersEthernetWildcardByte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS:Ethernet* SAI_PORT_STAT_PFC_7_RX_PKTS",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet*" >
 					elem: <name: "SAI_PORT_STAT_PFC_7_RX_PKTS" >
 				`,
-		wantRetCode: codes.OK,
-		wantRespVal: countersEthernetWildcardPfcByte,
-	}, {
-		desc:       "get COUNTERS:Ethernet* Pfcwd",
-		pathTarget: "COUNTERS_DB",
-		textPbPath: `
+			wantRetCode: codes.OK,
+			wantRespVal: countersEthernetWildcardPfcByte,
+			valTest:     true,
+		}, {
+			desc:       "get COUNTERS:Ethernet* Pfcwd",
+			pathTarget: "COUNTERS_DB",
+			textPbPath: `
 					elem: <name: "COUNTERS" >
 					elem: <name: "Ethernet*" >
 					elem: <name: "Pfcwd" >
@@ -707,9 +728,45 @@ func TestGnmiGet(t *testing.T) {
 			runTestGet(t, ctx, gClient, td.pathTarget, td.textPbPath, td.wantRetCode, td.wantRespVal, td.valTest)
 		})
 	}
-	s.s.Stop()
+
 }
 
+func TestGnmiGet(t *testing.T) {
+	//t.Log("Start server")
+	s := createServer(t, 8081)
+	go runServer(t, s)
+
+	prepareDb(t, sdcfg.GetDbDefaultNamespace())
+
+	runGnmiTestGet(t, sdcfg.GetDbDefaultNamespace())
+
+	s.s.Stop()
+}
+func TestGnmiGetMultiNs(t *testing.T) {
+	sdcfg.Init()
+	err := test_utils.SetupMultiNamespace()
+	if err != nil {
+		t.Fatalf("error Setting up MultiNamespace files with err %T", err)
+	}
+
+	/* https://www.gopherguides.com/articles/test-cleanup-in-go-1-14*/
+	t.Cleanup(func() {
+		if err := test_utils.CleanUpMultiNamespace(); err != nil {
+			t.Fatalf("error Cleaning up MultiNamespace files with err %T", err)
+
+		}
+	})
+
+	//t.Log("Start server")
+	s := createServer(t, 8081)
+	go runServer(t, s)
+
+	prepareDb(t, test_utils.GetMultiNsNamespace())
+
+	runGnmiTestGet(t, test_utils.GetMultiNsNamespace())
+
+	s.s.Stop()
+}
 func TestGnmiGetTranslib(t *testing.T) {
 	//t.Log("Start server")
 	s := createServer(t)
@@ -865,7 +922,7 @@ type tablePathValue struct {
 
 // runTestSubscribe subscribe DB path in stream mode or poll mode.
 // The return code and response value are compared with expected code and value.
-func runTestSubscribe(t *testing.T) {
+func runTestSubscribe(t *testing.T, namespace string) {
 	fileName := "../testdata/COUNTERS_PORT_NAME_MAP.txt"
 	countersPortNameMapByte, err := ioutil.ReadFile(fileName)
 	if err != nil {
@@ -1660,10 +1717,10 @@ func runTestSubscribe(t *testing.T) {
 			},
 		}}
 
-	rclient := getRedisClient(t)
+	rclient := getRedisClient(t, namespace)
 	defer rclient.Close()
 	for _, tt := range tests {
-		prepareDb(t)
+		prepareDb(t, namespace)
 		// Extra db preparation for this test case
 		for _, prepare := range tt.prepares {
 			switch prepare.op {
@@ -1746,7 +1803,29 @@ func TestGnmiSubscribe(t *testing.T) {
 	s := createServer(t)
 	go runServer(t, s)
 
-	runTestSubscribe(t)
+	runTestSubscribe(t, sdcfg.GetDbDefaultNamespace())
+
+	s.s.Stop()
+}
+func TestGnmiSubscribeMultiNs(t *testing.T) {
+	sdcfg.Init()
+	err := test_utils.SetupMultiNamespace()
+	if err != nil {
+		t.Fatalf("error Setting up MultiNamespace files with err %T", err)
+	}
+
+	/* https://www.gopherguides.com/articles/test-cleanup-in-go-1-14*/
+	t.Cleanup(func() {
+		if err := test_utils.CleanUpMultiNamespace(); err != nil {
+			t.Fatalf("error Cleaning up MultiNamespace files with err %T", err)
+
+		}
+	})
+
+	s := createServer(t)
+	go runServer(t, s)
+
+	runTestSubscribe(t, test_utils.GetMultiNsNamespace())
 
 	s.s.Stop()
 }
